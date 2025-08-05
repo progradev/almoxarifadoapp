@@ -1,4 +1,5 @@
 import { db, getItensCadastrados, ref, push, remove, update, get } from './firebase.js';
+import './styles.css';
 
 document.addEventListener("DOMContentLoaded", () => {
   renderHome();
