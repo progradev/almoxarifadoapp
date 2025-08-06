@@ -1,5 +1,7 @@
 import { db, getItensCadastrados, ref, push, remove, update, get } from './firebase.js';
 import './styles.css';
+import * as XLSX from 'xlsx';
+import { saveAs } from 'file-saver';
 
 document.addEventListener("DOMContentLoaded", () => {
   renderHome();
@@ -141,11 +143,11 @@ async function renderEstoque() {
   const container = document.getElementById('main-content');
   let itens = await getItensCadastrados();
 
-  // 💰 Calcular total antes de usar
+
 const totalEstoque = itens.reduce((sum, it) => sum + (it.quantidade * it.valorUnitario), 0);
 const totalFormatted = totalEstoque.toFixed(2);
 
-// Cria container de info e botões
+
 const infoContainer = document.createElement('div');
 infoContainer.style.margin = '16px 0';
 infoContainer.innerHTML = `<p style="font-weight:bold;">Valor total em estoque: R$ ${totalFormatted}</p>`;
@@ -156,21 +158,19 @@ infoContainer.innerHTML = `<p style="font-weight:bold;">Valor total em estoque: 
   </p>`;
 
 const btnCSV = document.createElement('button');
-btnCSV.textContent = 'Exportar CSV';
-btnCSV.className = 'btn-cadastrar';
+btnCSV.textContent = '📄 Exportar CSV';
+btnCSV.className = 'btn-export';
 btnCSV.onclick = () => exportarCSV(itens);
 infoContainer.appendChild(btnCSV);
 
 
 const btnXLSX = document.createElement('button');
-btnXLSX.textContent = 'Exportar Excel (.xlsx)';
-btnXLSX.className = 'btn-cadastrar';
+btnXLSX.textContent = '📊 Exportar Excel';
+btnXLSX.className = 'btn-export';
 btnXLSX.style.marginLeft = '8px';
 btnXLSX.onclick = () => exportarExcel(itens);
 infoContainer.appendChild(btnXLSX);
 
-
-container.appendChild(infoContainer);
 
 
   container.innerHTML = `
@@ -182,6 +182,7 @@ container.appendChild(infoContainer);
     <div id="estoqueLista" class="estoque-grid">🔄 Carregando...</div>
   `;
 
+  container.appendChild(infoContainer);
   const listaDiv = document.getElementById('estoqueLista');
 
   function exibirLista(filtrados) {
@@ -405,6 +406,7 @@ async function registrarUso(e) {
     };
 
     await push(ref(db, 'historico'), log);
+     await push(ref(db, `usuarios/${usuario}/logs`), logs);
 
     alert("✅ Uso registrado com sucesso!");
     renderControle();
@@ -416,12 +418,11 @@ async function registrarUso(e) {
 async function renderHistorico() {
   const container = document.getElementById('main-content');
   container.innerHTML = `
-    <h2> Histórico de Uso</h2>
+    <h2> Histórico de Retiradas por Pessoa</h2>
     <div id="historicoLista" class="historico-grid">🔄 Carregando...</div>
   `;
 
   const snapshot = await get(ref(db, 'historico'));
-
   const historicoDiv = document.getElementById('historicoLista');
 
   if (!snapshot.exists()) {
@@ -429,44 +430,135 @@ async function renderHistorico() {
     return;
   }
 
-  const dados = snapshot.val();
-  const logs = Object.values(dados).sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  const dados = Object.values(snapshot.val());
+  const agrupado = {};
 
-  historicoDiv.innerHTML = logs.map(log => `
-    <div class="historico-card fade-in">
-      <p><strong>Usuário:</strong> ${log.usuario}</p>
-      <p><strong>Item:</strong> ${log.item} (${log.codigo})</p>
-      <p><strong>Tipo:</strong> ${log.tipo === 'retirada' ? 'Retirada de Estoque' : log.tipo}</p>
-      <p><strong>Quantidade:</strong> ${log.quantidade}</p>
-      <p><strong>Data:</strong> ${new Date(log.timestamp).toLocaleString('pt-BR')}</p>
-    </div>
-  `).join('');
+  // Agrupa logs por usuário
+  dados.forEach(entry => {
+    const nome = entry.usuario;
+    if (!agrupado[nome]) agrupado[nome] = [];
+    agrupado[nome].push(entry);
+  });
+
+  // Cria os cards de usuários
+  historicoDiv.innerHTML = Object.entries(agrupado).map(([nome, logs]) => {
+    const total = logs.length;
+    const ultimo = new Date(Math.max(...logs.map(l => new Date(l.timestamp)))).toLocaleString('pt-BR');
+
+    return `
+      <div class="historico-card fade-in user-card" data-nome="${nome}">
+        <h3>${nome}</h3>
+        <p><strong>Registros:</strong> ${total}</p>
+        <p><strong>Última Retirada:</strong> ${ultimo}</p>
+      </div>
+    `;
+  }).join('');
+
+  // Evento de clique: abre modal com histórico individual
+  document.querySelectorAll('.user-card').forEach(card => {
+    card.onclick = () => abrirModalUsuario(card.dataset.nome, agrupado[card.dataset.nome]);
+  });
 }
 async function renderCarrinho() {
   const itens = await getItensCadastrados();
-
-  const rows = itens.map(item => `
-    <tr>
-      <td><input type="checkbox" data-id="${item.id}" data-nome="${item.nome}" data-codigo="${item.codigo}" data-quant="${item.quantidade}" /></td>
-      <td>${item.nome}</td>
-      <td>${item.codigo}</td>
-      <td>${item.quantidade}</td>
-      <td><input type="number" min="1" max="${item.quantidade}" class="input-quant" data-id="${item.id}" placeholder="0" style="width: 60px;" /></td>
-    </tr>
-  `).join('');
+  const faltando = itens.filter(i => i.quantidade <= i.limiteAlerta);
+  const faltandoData = faltando.map(item => ({
+    ...item,
+    qtdRepor: item.limiteAlerta - item.quantidade + 1,
+    total: (item.valorUnitario * (item.limiteAlerta - item.quantidade + 1))
+  }));
 
   document.getElementById('main-content').innerHTML = `
-    <h2>🛒 Carrinho de Retirada</h2>
+    <h2>🛒 Carrinho de Reposição</h2>
     <table style="width:100%; border-collapse: collapse;">
       <thead>
-        <tr><th>Selecionar</th><th>Item</th><th>Código</th><th>Estoque</th><th>Qtd Retirada</th></tr>
+        <tr><th>Selecionar</th><th>Item</th><th>Código</th><th>Estoque</th><th>Qtd</th><th>Total</th></tr>
       </thead>
-      <tbody>${rows}</tbody>
+      <tbody>
+        ${faltandoData.map(i => `
+          <tr data-id="${i.id}" data-unit="${i.valorUnitario}">
+            <td><input type="checkbox" checked data-mandatory></td>
+            <td>${i.nome}</td>
+            <td>${i.codigo}</td>
+            <td>${i.quantidade}</td>
+            <td><input type="number" value="${i.qtdRepor}" min="1" max="${i.limiteAlerta * 2}" class="qtd-input" style="width:60px;" /></td>
+            <td class="row-total">R$ ${i.total.toFixed(2)}</td>
+          </tr>
+        `).join('')}
+      </tbody>
     </table>
-    <button id="confirmarRetirada" class="btn-cadastrar" style="margin-top: 16px;">Confirmar Retirada</button>
+    <button id="incluirOutros" class="btn-cadastrar" style="margin-top:16px;">Adicionar outros itens</button>
+    <p id="totalGeral" style="margin-top:16px; font‑weight:bold;">Total: R$ ${faltandoData.reduce((s,i) => s + i.total,0).toFixed(2)}</p>
+    <button id="exportarReposicaoExcel" class="btn-export">📊 Exportar Carrinho</button>
   `;
 
-  document.getElementById('confirmarRetirada').onclick = handleConfirmarRetirada;
+  document.querySelectorAll('.qtd-input').forEach(input => {
+    input.oninput = () => updateRow(input);
+  });
+
+  document.getElementById('incluirOutros').onclick = () => renderSelecaoOutros(itens, faltando);
+  document.getElementById('exportarReposicaoExcel').onclick = () => exportarCarrinhoExcel();
+}
+function renderSelecaoOutros(itens, faltando) {
+  const faltIds = new Set(faltando.map(i => i.id));
+  const outros = itens.filter(i => !faltIds.has(i.id));
+
+  document.getElementById('main-content').innerHTML = `
+    <h2>📌 Adicionar Outros Itens</h2>
+    <form id="formOutros">
+      ${outros.map(i => `
+        <div style="margin-bottom:8px;">
+          <label>
+            <input type="checkbox" data-id="${i.id}" data-name="${i.nome}" data-codigo="${i.codigo}"
+                   data-estoque="${i.quantidade}" data-valor="${i.valorUnitario}" />
+            ${i.nome} (Qtd em estoque: ${i.quantidade})
+          </label>
+          <input type="number" min="1" max="${i.quantidade}" placeholder="Qtd" data-id="${i.id}" style="width:60px; margin-left:8px;" />
+        </div>
+      `).join('')}
+      <button type="submit" class="btn-cadastrar">Atualizar Carrinho</button>
+      <button type="button" id="voltarCarrinho" class="btn-export" style="margin-left:8px;">Voltar</button>
+    </form>
+  `;
+
+  document.getElementById('voltarCarrinho').onclick = renderCarrinho;
+  document.getElementById('formOutros').onsubmit = e => {
+    e.preventDefault();
+    const selec = Array.from(form.querySelectorAll('input[type="checkbox"]:checked')).map(cb => {
+      const id = cb.dataset.id;
+      const qtd = parseInt(document.querySelector(`input[data-id="${id}"][type="number"]`).value) || 0;
+      return { id, qtd };
+    });
+    renderCarrinhoExtras(selec, itens, faltando);
+  };
+}
+function renderCarrinhoExtras(selec, itens, faltando) {
+ 
+  const mixed = [
+    ...faltando.map(i => ({
+      id: i.id, nome: i.nome, codigo: i.codigo,
+      quantidade: i.quantidade, qtdRepor: i.limiteAlerta - i.quantidade + 1,
+      valorUnitario: i.valorUnitario
+    })),
+    ...selec.map(sel => {
+      const it = itens.find(i => i.id === sel.id);
+      return { ...it, qtdRepor: sel.qtd, valorUnitario: it.valorUnitario };
+    })
+  ];
+
+
+  const dados = mixed.map(i => ({
+    Nome: i.nome,
+    Código: i.codigo,
+    Quantidade: i.qtdRepor,
+    'Valor Unitário': i.valorUnitario,
+    Total: (i.qtdRepor * i.valorUnitario).toFixed(2)
+  }));
+
+  const worksheet = XLSX.utils.json_to_sheet(dados);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Carrinho Completo');
+  XLSX.writeFile(workbook, 'carrinho_reposicao_completo.xlsx');
 }
 async function handleConfirmarRetirada() {
   const checkboxes = Array.from(document.querySelectorAll('input[type="checkbox"]:checked'));
@@ -509,6 +601,25 @@ async function handleConfirmarRetirada() {
     alert('Erro ao processar retirada.');
   }
 }
+function updateRow(input) {
+  const row = input.closest('tr');
+  const unitPrice = parseFloat(row.dataset.unit);
+  const qtd = parseInt(input.value) || 0;
+  const total = qtd * unitPrice;
+
+  row.querySelector('.row-total').textContent = `R$ ${total.toFixed(2)}`;
+
+  // Atualiza o total geral do carrinho
+  let totalGeral = 0;
+  document.querySelectorAll('.qtd-input').forEach(inp => {
+    const linha = inp.closest('tr');
+    const unit = parseFloat(linha.dataset.unit);
+    const qtdAtual = parseInt(inp.value) || 0;
+    totalGeral += unit * qtdAtual;
+  });
+
+  document.getElementById('totalGeral').textContent = `Total: R$ ${totalGeral.toFixed(2)}`;
+}
 function exportarCSV(itens) {
   const headers = ["Nome", "Código", "Quantidade", "Valor Unitário", "Total"];
   const rows = itens.map(it => [
@@ -522,8 +633,6 @@ function exportarCSV(itens) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   saveAs(blob, "estoque.csv");
 }
-
-import * as XLSX from 'xlsx'; // ← certifique-se de importar isso no topo do arquivo!
 
 function exportarExcel(itens) {
   const dados = itens.map(it => ({
@@ -541,4 +650,54 @@ function exportarExcel(itens) {
   XLSX.utils.book_append_sheet(livro, planilha, 'Estoque');
 
   XLSX.writeFile(livro, 'estoque.xlsx');
+}
+function exportarCarrinhoExcel() {
+  const linhas = Array.from(document.querySelectorAll('tbody tr'));
+
+  const dados = linhas.map(linha => {
+    const nome = linha.children[1].textContent;
+    const codigo = linha.children[2].textContent;
+    const qtdAtual = linha.children[3].textContent;
+    const qtdRepor = linha.querySelector('.qtd-input').value;
+    const unit = parseFloat(linha.dataset.unit);
+    const total = (parseInt(qtdRepor) || 0) * unit;
+
+    return {
+      Nome: nome,
+      Código: codigo,
+      'Qtd Atual': qtdAtual,
+      'Qtd Repor': qtdRepor,
+      'Valor Unitário': unit.toFixed(2),
+      Total: total.toFixed(2)
+    };
+  });
+
+  const ws = XLSX.utils.json_to_sheet(dados);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Carrinho');
+  XLSX.writeFile(wb, 'carrinho_reposicao.xlsx');
+}
+function abrirModalUsuario(nome, logs) {
+  const modalHTML = `
+    <div class="modal-backdrop" id="modalBackdrop">
+      <div class="item-modal">
+        <button class="modal-close-btn" id="closeModalBtn">&times;</button>
+        <h2>Histórico de ${nome}</h2>
+        <div style="max-height: 60vh; overflow-y: auto;">
+          ${logs.map(log => `
+            <p><strong>Item:</strong> ${log.item} (${log.codigo})<br/>
+               <strong>Qtd:</strong> ${log.quantidade}<br/>
+               <strong>Data:</strong> ${new Date(log.timestamp).toLocaleString('pt-BR')}</p>
+            <hr/>
+          `).join('')}
+        </div>
+      </div>
+    </div>
+  `;
+
+  document.body.insertAdjacentHTML('beforeend', modalHTML);
+  document.getElementById('closeModalBtn').onclick = closeModal;
+  document.getElementById('modalBackdrop').onclick = e => {
+    if (e.target.id === 'modalBackdrop') closeModal();
+  };
 }
